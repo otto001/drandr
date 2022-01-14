@@ -11,6 +11,8 @@ static const char *colors[SchemeLast][3] = {
         [SchemeMon] = { "#eeeeee", "#555555" },
 };
 
-static int width = 1000;
-static int height = 600;
+static int width = 1400;
+static int height = 800;
+static int side_area = 400;
+
 static int interval = 16;

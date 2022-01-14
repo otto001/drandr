@@ -41,6 +41,7 @@ static int bh, mw, mh, lrpad;
 static int mon = -1, screen;
 
 static int st, sr, sb, sl; // top, right, bottom, left of screen
+static int cw, ch; // canvas height and width
 static int mcw, mch; // maximum possible screen size (w & h indepentent)
 static double canvas_scale = 1.0/12;
 
@@ -78,11 +79,13 @@ struct OutputConnection {
     const char *edid;
     XRROutputInfo *info;
     XRRCrtcInfo *crtc_info;
+
     OutputConnection *next;
     OutputConnection *prev;
 
     int cx, cy, cw, ch; // positions and sizes in canvas (gui), scaled down and translated from real values
     int x, y, w, h; // new, "real" positions and sizes
+    RRMode mode;
 
 };
 
@@ -96,8 +99,13 @@ int n_crtc_wins;
 
 static OutputConnection *head;
 
-static OutputConnection *grabbed;
+static OutputConnection *selected_ocon;
+static OutputConnection *grabbed_ocon;
 int grabbed_offset_x, grabbed_offset_y;
+
+static int selected_mode = 0;
+
+XRRScreenResources *sres;
 
 void remove_output_connection(OutputConnection *ocon);
 static void reset_canvas_positions();
@@ -106,7 +114,7 @@ static void update_window_size();
 static void recenter_canvas();
 static void update_canvas();
 static void apply();
-static void create_crtc_windows(XRRScreenResources *sres);
+static void create_crtc_windows();
 
 Button button_apply = {0, 0, 100, 12, "Apply", apply};
 Button* buttons[] = {&button_apply};
@@ -122,12 +130,16 @@ static void cleanup(void) {
     }
 }
 
+XRRModeInfo *get_mode_info(RRMode id) {
+    int i;
+    for (i = 0; i < sres->nmode && sres->modes[i].id != id; i++) {}
+    return &sres->modes[i];
+}
 
 void free_output_connection(OutputConnection *ocon) {
     if (ocon) {
-        if (ocon == grabbed) {
-            grabbed = NULL;
-        }
+        if (ocon == grabbed_ocon) grabbed_ocon = NULL;
+        if (ocon == selected_ocon) selected_ocon = NULL;
         XRRFreeOutputInfo(ocon->info);
         XRRFreeCrtcInfo(ocon->crtc_info);
         free((char*) ocon->edid);
@@ -162,49 +174,12 @@ void append_output_connection(OutputConnection *ocon) {
     ocon->prev = last_ocon;
 }
 
-//int get_sid(Display *dpy, RROutput output) {
-//    XRRMonitorInfo *mi;
-//    XRRScreenResources *sres;
-//    XineramaScreenInfo *si;
-//    int i, j, k, sid = -1;
-//    int nmonitors, nscreens;
-//
-//    si = XineramaQueryScreens(dpy, &nscreens);
-//    mi = XRRGetMonitors(dpy, DefaultRootWindow(dpy), True, &nmonitors);
-//    sres = XRRGetScreenResourcesCurrent(dpy, DefaultRootWindow(dpy));
-//
-//    for (j = 0; j < nmonitors; ++j) {
-//        for (k = 0; k < mi[j].noutput && mi[j].outputs[k] != output; ++k) {
-//            ;
-//        }
-//        if (k < mi[j].noutput) {
-//            break;
-//        }
-//    }
-//
-//    if (si && mi && j < nmonitors) {
-//        for (i = 0; i < nscreens; ++i) {
-//            if (si[i].x_org == mi[j].x &&
-//                si[i].y_org == mi[j].y && si[i].width == mi[j].width && si[i].height == mi[j].height) {
-//                sid = i;
-//                break;
-//            }
-//        }
-//        XFree(si);
-//        XRRFreeMonitors(mi);
-//    }
-//    XRRFreeScreenResources(sres);
-//
-//    return sid;
-//}
 
 const char *get_edid(Display* dpy, RROutput out) {
     int props = 0;
     Atom *properties;
     Atom atom_edid, real;
     int i, format;
-//    uint16_t vendor, product;
-//    uint32_t serial;
     char *edid = NULL;
     unsigned char *p;
     char *ep;
@@ -226,10 +201,6 @@ const char *get_edid(Display* dpy, RROutput out) {
         if (XRRGetOutputProperty(dpy, out, atom_edid, 0L, 128L, False, False,
                                  AnyPropertyType, &real, &format, &n, &extra, &p) == Success) {
             if (n >= 127) {
-//                vendor = (p[9] << 8) | p[8];
-//                product = (p[11] << 8) | p[10];
-//                serial = p[15] << 24 | p[14] << 16 | p[13] << 8 | p[12];
-//                snprintf(edid, edidlen, "%04X%04X%08X", vendor, product, serial);
                 edid = ecalloc(2*n+1, sizeof(char));
                 ep = edid;
                 for (i = 0; i < n; i++) {
@@ -245,13 +216,9 @@ const char *get_edid(Display* dpy, RROutput out) {
 }
 
 OutputConnection *create_output_connection(RROutput output, XRROutputInfo *info) {
-    XRRScreenResources *sres;
     XRRModeInfo *mode_info;
     OutputConnection *ocon;
     const char* edid;
-    int i;
-
-    sres = XRRGetScreenResourcesCurrent(dpy, DefaultRootWindow(dpy));
 
     if (!info) {
         info = XRRGetOutputInfo(dpy, sres, output);
@@ -271,25 +238,24 @@ OutputConnection *create_output_connection(RROutput output, XRROutputInfo *info)
     ocon = ecalloc(1, sizeof(OutputConnection));
     memset(ocon, 0, sizeof(OutputConnection));
     ocon->output = output;
+    ocon->mode = 0;
 
     ocon->edid = edid;
 
     ocon->info = info;
+
     if (info->crtc) {
         ocon->crtc_info = XRRGetCrtcInfo(dpy, sres, info->crtc);
         ocon->x = ocon->crtc_info->x;
         ocon->y = ocon->crtc_info->y;
         ocon->w = ocon->crtc_info->width;
         ocon->h = ocon->crtc_info->height;
+        ocon->mode = ocon->crtc_info->mode;
+
     } else {
         ocon->crtc_info = NULL;
 
-        for (i = 0; i < sres->nmode; i++) {
-            if (sres->modes[i].id == ocon->info->modes[0]) {
-                mode_info = &sres->modes[i];
-                break;
-            }
-        }
+        mode_info = get_mode_info(ocon->info->modes[ocon->mode]);
         if (mode_info) {
             ocon->x = 0;
             ocon->y = 0;
@@ -299,21 +265,15 @@ OutputConnection *create_output_connection(RROutput output, XRROutputInfo *info)
     }
 
     append_output_connection(ocon);
-    XRRFreeScreenResources(sres);
     return ocon;
 }
 
 
 void get_outputs() {
-    XRRScreenResources *sres;
     XRROutputInfo *info;
     int i;
 
-    sres = XRRGetScreenResources(dpy, root);
-    if (!sres) {
-        fprintf(stderr, "Could not get screen resources\n");
-        return;
-    }
+
     for (i = 0; i < sres->noutput; i++) {
         info = XRRGetOutputInfo(dpy, sres, sres->outputs[i]);
         if (info->connection == RR_Connected) {
@@ -323,17 +283,13 @@ void get_outputs() {
         }
     }
     create_crtc_windows(sres);
-
-    XRRFreeScreenResources(sres);
 }
 
-
-
 static void handle_output_change_event(XRROutputChangeNotifyEvent *ev) {
-    XRRScreenResources *sres;
     XRROutputInfo *info;
     OutputConnection *ocon;
 
+    if (sres) XRRFreeScreenResources(sres);
     sres = XRRGetScreenResourcesCurrent(ev->display, ev->window);
     if (!sres) {
         fprintf(stderr, "Could not get screen resources\n");
@@ -343,11 +299,9 @@ static void handle_output_change_event(XRROutputChangeNotifyEvent *ev) {
     fflush(stdout);
     info = XRRGetOutputInfo(ev->display, sres, ev->output);
     if (!info) {
-        XRRFreeScreenResources(sres);
         fprintf(stderr, "Could not get output info\n");
         return;
     }
-
 
     switch (info->connection) {
         case RR_Connected:
@@ -370,7 +324,6 @@ static void handle_output_change_event(XRROutputChangeNotifyEvent *ev) {
 
     update_canvas();
 
-    XRRFreeScreenResources(sres);
     XRRFreeOutputInfo(info);
 }
 
@@ -424,13 +377,13 @@ static void setup_new_coordinates(int *screen_width, int *screen_height, int *sc
     *screen_height_mm = (int) ((25.4 * (double)(*screen_height)) / (*dpi));
 }
 
-static void disable_crtc(XRRScreenResources *sres, RRCrtc ctrc) {
+static void disable_crtc(RRCrtc ctrc) {
     XRRSetCrtcConfig (dpy, sres, ctrc, CurrentTime,
                       0, 0, None, RR_Rotate_0, NULL, 0);
     printf("disbaled crtc %d\n", ctrc);
 }
 
-static void disable_unused_crtcs(XRRScreenResources *sres, int screen_width, int screen_height) {
+static void disable_unused_crtcs(int screen_width, int screen_height) {
     OutputConnection *ocon;
     XRRCrtcInfo *crtc_info;
     XRROutputInfo *output_info;
@@ -449,7 +402,7 @@ static void disable_unused_crtcs(XRRScreenResources *sres, int screen_width, int
         if (crtc_info->x + crtc_info->width > screen_width
                 || crtc_info->y + crtc_info->height > screen_height
                 || crtc_info->noutput == 0) {
-            disable_crtc(sres, sres->crtcs[i]);
+            disable_crtc(sres->crtcs[i]);
         } else if (crtc_info->noutput > 0) {
             // disable if no assigned output is connected
             output_connected = False;
@@ -463,14 +416,14 @@ static void disable_unused_crtcs(XRRScreenResources *sres, int screen_width, int
                 XRRFreeOutputInfo(output_info);
             }
             if (output_connected == False) {
-                disable_crtc(sres, sres->crtcs[i]);
+                disable_crtc(sres->crtcs[i]);
             }
         }
         XRRFreeCrtcInfo(crtc_info);
     }
 }
 
-static Status add_output_to_unused_crtc(XRRScreenResources *sres, OutputConnection* ocon) {
+static Status add_output_to_unused_crtc(OutputConnection* ocon) {
     Status s;
     int i;
     XRRCrtcInfo *crtc_info;
@@ -491,7 +444,7 @@ static Status add_output_to_unused_crtc(XRRScreenResources *sres, OutputConnecti
         printf("Setting: %lu %s: crtc: %lu mode: %lu\n", ocon->output, ocon->info->name, sres->crtcs[i], ocon->info->modes[0]);
 
         s = XRRSetCrtcConfig(dpy, sres, sres->crtcs[i], CurrentTime,
-                             ocon->x, ocon->y, ocon->info->modes[0], RR_Rotate_0,
+                             ocon->x, ocon->y, ocon->mode, RR_Rotate_0,
                              outputs, 1);
         XRRFreeCrtcInfo(crtc_info);
         break;
@@ -499,7 +452,7 @@ static Status add_output_to_unused_crtc(XRRScreenResources *sres, OutputConnecti
     return s;
 }
 
-static void apply_output(XRRScreenResources *sres, OutputConnection* ocon) {
+static void apply_output(OutputConnection* ocon) {
     Status s;
 
     s = RRSetConfigFailed;
@@ -508,10 +461,10 @@ static void apply_output(XRRScreenResources *sres, OutputConnection* ocon) {
         printf("Setting: %lu %s: crtc: %lu mode: %lu\n", ocon->output, ocon->info->name, ocon->info->crtc, ocon->crtc_info->mode);
 
         s = XRRSetCrtcConfig (dpy, sres, ocon->info->crtc, CurrentTime,
-                              ocon->x, ocon->y, ocon->crtc_info->mode, ocon->crtc_info->rotation,
+                              ocon->x, ocon->y, ocon->mode, ocon->crtc_info->rotation,
                               ocon->crtc_info->outputs, ocon->crtc_info->noutput);
     } else {
-       s = add_output_to_unused_crtc(sres, ocon);
+       s = add_output_to_unused_crtc(ocon);
     }
 
     if (s == RRSetConfigSuccess) {
@@ -523,16 +476,15 @@ static void apply_output(XRRScreenResources *sres, OutputConnection* ocon) {
 
 static void apply() {
     OutputConnection *ocon;
-    XRRScreenResources *sres;
     int screen_width, screen_height, screen_width_mm, screen_height_mm;
     double dpi;
     setup_new_coordinates(&screen_width, &screen_height, &screen_width_mm, &screen_height_mm, &dpi);
-    sres = XRRGetScreenResourcesCurrent(dpy, DefaultRootWindow(dpy));
+
     printf("Apply\n");
 
     XGrabServer(dpy);
 
-    disable_unused_crtcs(sres, screen_width, screen_height);
+    disable_unused_crtcs(screen_width, screen_height);
 
     printf("screen %d: %dx%d %dx%d mm %6.2fdpi\n", screen,
            screen_width, screen_height, screen_width_mm, screen_height_mm, dpi);
@@ -542,14 +494,38 @@ static void apply() {
 
 
     for (ocon = head; ocon; ocon = ocon->next) {
-        apply_output(sres, ocon);
+        apply_output(ocon);
     }
 
     XUngrabServer(dpy);
-    XRRFreeScreenResources(sres);
     XSync(dpy, False);
     get_outputs();
     update_canvas();
+}
+
+/* v refresh frequency in Hz */
+static double mode_refresh (const XRRModeInfo *mode_info)
+{
+    double rate;
+    double vTotal = mode_info->vTotal;
+
+    if (mode_info->modeFlags & RR_DoubleScan) {
+        /* doublescan doubles the number of lines */
+        vTotal *= 2;
+    }
+
+    if (mode_info->modeFlags & RR_Interlace) {
+        /* interlace splits the frame into two fields */
+        /* the field rate is what is typically reported by monitors */
+        vTotal /= 2;
+    }
+
+    if (mode_info->hTotal && vTotal)
+        rate = ((double) mode_info->dotClock /
+                ((double) mode_info->hTotal * (double) vTotal));
+    else
+        rate = 0;
+    return rate;
 }
 
 static void update_canvas() {
@@ -571,8 +547,8 @@ static void reset_canvas_positions() {
         ocon->cw = (int) ((double) ocon->w * canvas_scale);
         ocon->ch = (int) ((double) ocon->h * canvas_scale);
 
-        ocon->cx = (int) (((double) ocon->x - canvas_offset_x) * canvas_scale) + mw/2;
-        ocon->cy = (int) (((double) ocon->y - canvas_offset_y) * canvas_scale) + mh/2;
+        ocon->cx = (int) (((double) ocon->x - canvas_offset_x) * canvas_scale) + cw/2;
+        ocon->cy = (int) (((double) ocon->y - canvas_offset_y) * canvas_scale) + ch/2;
     }
 }
 
@@ -585,8 +561,8 @@ static void recenter_canvas() {
         cb = MAX(cb, ocon->cy + ocon->ch);
         cl = MIN(cl, ocon->cx);
     }
-    c_offset_x = (cl + cr)/2 - mw/2;
-    c_offset_y = (ct + cb)/2 - mh/2;
+    c_offset_x = (cl + cr)/2 - cw/2;
+    c_offset_y = (ct + cb)/2 - ch/2;
     for (ocon = head; ocon; ocon = ocon->next) {
         ocon->cx -= c_offset_x;
         ocon->cy -= c_offset_y;
@@ -681,10 +657,11 @@ static void update_window_size() {
     if (head) {
         XGetWindowAttributes(dpy, win, &wa);
 
-//        mw = (int) (((double) mcw * 2) * canvas_scale);
-//        mh = (int) (((double) mch * 2) * canvas_scale);
-        canvas_scale_x = mw/((double) mcw * 2);
-        canvas_scale_y = mh/((double) mch * 2);
+        cw = mw - side_area;
+        ch = mh;
+
+        canvas_scale_x = cw/((double) mcw * 2);
+        canvas_scale_y = ch/((double) mch * 2);
         canvas_scale = MIN(canvas_scale_x, canvas_scale_y);
 
         for (win_ocon = head; win_ocon && win_ocon->output != win_output; win_ocon = win_ocon->next) {}
@@ -721,8 +698,9 @@ static void draw_output(OutputConnection *ocon) {
     int bw=2, y=ocon->cy;
     int boxs = drw->fonts->h / 9;
     int boxw = drw->fonts->h / 6 + 2;
+    Bool is_selected = ocon == grabbed_ocon || ocon == selected_ocon;
 
-    drw_setscheme(drw, ocon == grabbed ? scheme[SchemeSel] : scheme[SchemeMon]);
+    drw_setscheme(drw, is_selected ? scheme[SchemeSel] : scheme[SchemeMon]);
     drw_rect(drw, ocon->cx, y, ocon->cw, ocon->ch, 1, 0);
     drw_rect(drw, ocon->cx+1, y+1, ocon->cw-2, ocon->ch-2, 1, 1);
 
@@ -742,8 +720,25 @@ static void draw_output(OutputConnection *ocon) {
     y += bh;
     drw_rect(drw, ocon->cx+1+bw, y, ocon->cw-2-2*bw, ocon->ch-1-1*bw - (y - ocon->cy), 1, 1);
     if (bw > 0) {
-        drw_setscheme(drw, ocon == grabbed ? scheme[SchemeSel] : scheme[SchemeMon]);
+        drw_setscheme(drw, is_selected ? scheme[SchemeSel] : scheme[SchemeMon]);
         drw_rect(drw, ocon->cx+1, ocon->cy+1+bh, bw, ocon->ch-1-bh-1*bw, 1, 1);
+    }
+}
+
+static void draw_modes() {
+    int i, start;
+    XRRModeInfo *mode_info;
+
+    start = selected_mode - (mh-2*bh)/bh;
+    start = MAX(start, 0);
+    for (i = start; i < selected_ocon->info->nmode; i++) {
+        mode_info = get_mode_info(selected_ocon->info->modes[i]);
+
+        drw_setscheme(drw, i == selected_mode ? scheme[SchemeSel] : scheme[SchemeNorm]);
+
+        snprintf(buf, sizeof(buf), "%s %s %6.2fHz %s", mode_info->id == selected_ocon->mode ? "*" : " ",
+                 mode_info->name, mode_refresh(mode_info), i < selected_ocon->info->npreferred ? "(rec.)" : "");
+        drw_text(drw, cw, 0 + bh*(i-start), side_area, bh, lrpad/2, buf, 0);
     }
 }
 
@@ -753,14 +748,22 @@ static void draw(void) {
     drw_setscheme(drw, scheme[SchemeNorm]);
     drw_rect(drw, 0, 0, mw, mh, 1, 1);
 
+    drw_rect(drw, 0, 0, cw, ch, 0, 0);
 
     for (OutputConnection* ocon = head; ocon; ocon = ocon->next) {
-        if (ocon != grabbed) {
+        if (ocon != grabbed_ocon) {
             draw_output(ocon);
         }
     }
-    if (grabbed) {
-        draw_output(grabbed);
+    if (grabbed_ocon) {
+        draw_output(grabbed_ocon);
+    }
+
+    drw_setscheme(drw, scheme[SchemeNorm]);
+    drw_rect(drw, cw, 0, cw-mw, mh, 1, 1);
+
+    if (selected_ocon) {
+       draw_modes();
     }
 
     for (i = 0; i < LENGTH(buttons); i++) {
@@ -768,6 +771,14 @@ static void draw(void) {
         drw_text(drw, buttons[i]->x, buttons[i]->y, buttons[i]->w, buttons[i]->h, lrpad/2, buttons[i]->text, 0);
     }
     drw_map(drw, win, 0, 0, mw, mh);
+}
+
+static void select_mode(OutputConnection *ocon, RRMode mode) {
+    XRRModeInfo *mode_info = get_mode_info(mode);
+    ocon->mode = mode;
+    ocon->w = mode_info->width;
+    ocon->h = mode_info->height;
+    update_canvas();
 }
 
 static void buttonpress(XButtonPressedEvent *e) {
@@ -779,12 +790,12 @@ static void buttonpress(XButtonPressedEvent *e) {
         for (OutputConnection* ocon = head; ocon; ocon = ocon->next) {
             if (x >= ocon->cx && x <= ocon->cx + ocon->cw
                 && y >= ocon->cy && y <= ocon->cy + ocon->ch) {
-                grabbed = ocon;
+                grabbed_ocon = ocon;
                 grabbed_offset_x = ocon->cx - x;
                 grabbed_offset_y = ocon->cy - y;
             }
         }
-        if (!grabbed) {
+        if (!grabbed_ocon) {
             for (i = 0; i < LENGTH(buttons); i++) {
                 if (x >= buttons[i]->x && x <= buttons[i]->x + buttons[i]->w
                     && y >= buttons[i]->y && y <= buttons[i]->y + buttons[i]->h) {
@@ -797,9 +808,11 @@ static void buttonpress(XButtonPressedEvent *e) {
 
 static void buttonrelease(XButtonReleasedEvent *e) {
     if (e->button == 1) {
-        if (grabbed) {
-            snap_output(grabbed);
-            grabbed = NULL;
+        if (grabbed_ocon) {
+            selected_ocon = grabbed_ocon;
+            selected_mode = 0;
+            snap_output(grabbed_ocon);
+            grabbed_ocon = NULL;
             recenter_canvas();
         }
     }
@@ -810,9 +823,9 @@ static void motion(XPointerMovedEvent *e) {
     x = e->x;
     y = e->y;
 
-    if (grabbed) {
-        grabbed->cx = x + grabbed_offset_x;
-        grabbed->cy = y + grabbed_offset_y;
+    if (grabbed_ocon) {
+        grabbed_ocon->cx = x + grabbed_offset_x;
+        grabbed_ocon->cy = y + grabbed_offset_y;
     } else {
         hovered_button = NULL;
         for (i = 0; i < LENGTH(buttons); i++) {
@@ -840,6 +853,22 @@ static void keypress(XKeyEvent *ev) {
     switch (ksym) {
         default:
             return;
+        case XK_Up:
+            if (selected_ocon && selected_mode > 0) {
+                selected_mode--;
+            }
+            break;
+        case XK_Down:
+            if (selected_ocon && selected_mode < selected_ocon->info->nmode-1) {
+                selected_mode++;
+            }
+            break;
+        case XK_Return:
+        case XK_KP_Enter:
+            if (selected_ocon && selected_mode >= 0 && selected_mode < selected_ocon->info->nmode) {
+                select_mode(selected_ocon, selected_ocon->info->modes[selected_mode]);
+            }
+            break;
         case XK_Escape:
         case XK_q:
             exit(0);
@@ -930,7 +959,7 @@ static void grab_keyboard(void) {
     die("cannot grab keyboard");
 }
 
-static void create_crtc_windows(XRRScreenResources *sres) {
+static void create_crtc_windows() {
     XClassHint ch = {"drandr", "drandr"};
     XWindowAttributes wa;
     XSetWindowAttributes swa;
@@ -1092,6 +1121,12 @@ static void setup(void) {
 
     grab_focus();
     grab_keyboard();
+
+    sres = XRRGetScreenResources(dpy, root);
+    if (!sres) {
+        fprintf(stderr, "Could not get screen resources\n");
+        return;
+    }
 
     XRRSelectInput(dpy, root, RRScreenChangeNotifyMask | RRCrtcChangeNotifyMask | RROutputChangeNotifyMask | RROutputPropertyNotifyMask);
     XSync(dpy, False);

@@ -42,7 +42,7 @@ static int mon = -1, screen;
 
 static int st, sr, sb, sl; // top, right, bottom, left of screen
 static int mcw, mch; // maximum possible screen size (w & h indepentent)
-static double canvas_scale = 1.0/10;
+static double canvas_scale = 1.0/12;
 
 static Display *dpy;
 static Window root, parentWin, win;
@@ -662,6 +662,7 @@ static void update_total_screen_size() {
 
 static void update_window_size() {
     int new_x, new_y;
+    double canvas_scale_x, canvas_scale_y;
     XWindowAttributes wa;
     XWindowChanges wc;
     OutputConnection *win_ocon;
@@ -669,8 +670,11 @@ static void update_window_size() {
     if (head) {
         XGetWindowAttributes(dpy, win, &wa);
 
-        mw = (int) (((double) mcw * 2) * canvas_scale);
-        mh = (int) (((double) mch * 2) * canvas_scale);
+//        mw = (int) (((double) mcw * 2) * canvas_scale);
+//        mh = (int) (((double) mch * 2) * canvas_scale);
+        canvas_scale_x = mw/((double) mcw * 2);
+        canvas_scale_y = mh/((double) mch * 2);
+        canvas_scale = MIN(canvas_scale_x, canvas_scale_y);
 
         for (win_ocon = head; win_ocon && win_ocon->output != win_output; win_ocon = win_ocon->next) {}
         if (!win_ocon) {
@@ -693,11 +697,12 @@ static void update_window_size() {
 
             reset_canvas_positions();
 
-            button_apply.h = bh;
-            button_apply.y = mh - bh;
-            button_apply.x = mw - TEXTW(button_apply.text);
         }
     }
+
+    button_apply.h = bh;
+    button_apply.y = mh - bh;
+    button_apply.x = mw - TEXTW(button_apply.text);
 
 }
 

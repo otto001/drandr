@@ -85,6 +85,7 @@ struct OutputConnection {
 
     int cx, cy, cw, ch; // positions and sizes in canvas (gui), scaled down and translated from real values
     int x, y, w, h; // new, "real" positions and sizes
+    Bool disabled;
     RRMode mode;
 
 };
@@ -103,7 +104,7 @@ static OutputConnection *selected_ocon;
 static OutputConnection *grabbed_ocon;
 int grabbed_offset_x, grabbed_offset_y;
 
-static int selected_mode = 0;
+static int selected_mode = 0, start_mode=0;
 
 XRRScreenResources *sres;
 
@@ -263,6 +264,7 @@ OutputConnection *create_output_connection(RROutput output, XRROutputInfo *info)
             ocon->h = (int) mode_info->height;
         }
     }
+    ocon->disabled = ocon->crtc_info == NULL || ocon->info->connection == RR_Disconnected;
 
     append_output_connection(ocon);
     return ocon;
@@ -295,8 +297,6 @@ static void handle_output_change_event(XRROutputChangeNotifyEvent *ev) {
         fprintf(stderr, "Could not get screen resources\n");
         return;
     }
-    printf("handle_output_change_event.XRRGetOutputInfo %d\n", ev->output);
-    fflush(stdout);
     info = XRRGetOutputInfo(ev->display, sres, ev->output);
     if (!info) {
         fprintf(stderr, "Could not get output info\n");
@@ -350,7 +350,7 @@ static void setup_new_coordinates(int *screen_width, int *screen_height, int *sc
     *dpi = (25.4 * reference->crtc_info->height) / (double) reference->info->mm_height;
 
     for (ocon = head; ocon; ocon = ocon->next) {
-        if (ocon->info->connection == RR_Disconnected) continue;
+        if (ocon->info->connection == RR_Disconnected || ocon->disabled) continue;
         ocon->x = (int) ((ocon->cx - reference->cx) / canvas_scale);
         ocon->y = (int) ((ocon->cy - reference->cy) / canvas_scale);
         int ocun_right = (int) ocon->x + ocon->w;
@@ -398,13 +398,13 @@ static void disable_unused_crtcs(int screen_width, int screen_height) {
             continue;
         };
 
-        // disable if not in screen or no output assigned
+        // disabled if not in screen or no output assigned
         if (crtc_info->x + crtc_info->width > screen_width
                 || crtc_info->y + crtc_info->height > screen_height
                 || crtc_info->noutput == 0) {
             disable_crtc(sres->crtcs[i]);
         } else if (crtc_info->noutput > 0) {
-            // disable if no assigned output is connected
+            // disabled if no assigned output is connected
             output_connected = False;
             for (o = 0; o < crtc_info->noutput; o++) {
                 output_info = XRRGetOutputInfo(dpy, sres, crtc_info->outputs[o]);
@@ -458,11 +458,16 @@ static void apply_output(OutputConnection* ocon) {
     s = RRSetConfigFailed;
 
     if (ocon->crtc_info) {
-        printf("Setting: %lu %s: crtc: %lu mode: %lu\n", ocon->output, ocon->info->name, ocon->info->crtc, ocon->crtc_info->mode);
+        if (ocon->disabled) {
+            disable_crtc(ocon->info->crtc);
+        } else {
+            printf("Setting: %lu %s: crtc: %lu mode: %lu\n", ocon->output, ocon->info->name, ocon->info->crtc, ocon->crtc_info->mode);
 
-        s = XRRSetCrtcConfig (dpy, sres, ocon->info->crtc, CurrentTime,
-                              ocon->x, ocon->y, ocon->mode, ocon->crtc_info->rotation,
-                              ocon->crtc_info->outputs, ocon->crtc_info->noutput);
+            s = XRRSetCrtcConfig(dpy, sres, ocon->info->crtc, CurrentTime,
+                                 ocon->x, ocon->y, ocon->mode, ocon->crtc_info->rotation,
+                                 ocon->crtc_info->outputs, ocon->crtc_info->noutput);
+        }
+
     } else {
        s = add_output_to_unused_crtc(ocon);
     }
@@ -569,39 +574,50 @@ static void recenter_canvas() {
     }
 }
 
-static void snap_output(OutputConnection *ocon) {
-    int axis = -1; // 0 = snap along x axis, 1 = snap along y axis
+static OutputConnection *get_snap_target(OutputConnection *ocon, int *axis, Bool overlap) {
+    // axis: 0 = snap along x axis, 1 = snap along y axis
     int dist, min_dist;
     min_dist = INT_MAX;
-    OutputConnection *snap_target, *iter;
+    OutputConnection *snap_target = NULL, *iter;
 
     for (iter = head; iter; iter = iter->next) {
         if (iter == ocon) continue;
-        if (iter->cx + iter->cw >= ocon->cx && iter->cx <= ocon->cx + ocon->cw) {
+        if ((iter->cx + iter->cw >= ocon->cx && iter->cx <= ocon->cx + ocon->cw) || !overlap) {
             if (ocon->cy >= iter->cy) {
                 dist = abs(ocon->cy - iter->cy - iter->ch);
             } else {
                 dist = abs(iter->cy - ocon->cy - ocon->ch);
             }
             if (dist < min_dist) {
-                axis = 1;
+                *axis = 1;
                 min_dist = dist;
                 snap_target = iter;
             }
         }
 
-        if (iter->cy + iter->ch >= ocon->cy && iter->cy <= ocon->cy + ocon->ch) {
+        if ((iter->cy + iter->ch >= ocon->cy && iter->cy <= ocon->cy + ocon->ch) || !overlap) {
             if (ocon->cx >= iter->cx) {
                 dist = abs(ocon->cx - iter->cx - iter->cw);
             } else {
                 dist = abs(iter->cx - ocon->cx - ocon->cw);
             }
             if (dist < min_dist) {
-                axis = 0;
+                *axis = 0;
                 min_dist = dist;
                 snap_target = iter;
             }
         }
+    }
+    return snap_target;
+}
+
+static void snap_output(OutputConnection *ocon) {
+    int axis = -1; // 0 = snap along x axis, 1 = snap along y axis
+    OutputConnection *snap_target, *iter;
+
+    snap_target = get_snap_target(ocon, &axis, True);
+    if (!snap_target) {
+        snap_target = get_snap_target(ocon, &axis, False);
     }
 
     if (axis == 0) {
@@ -610,8 +626,10 @@ static void snap_output(OutputConnection *ocon) {
         } else {
             ocon->cx = snap_target->cx - ocon->cw;
         }
-        if (abs(ocon->cy - snap_target->cy) < 10 || abs(ocon->cy + ocon->ch - snap_target->cy - snap_target->ch) < 10) {
+        if (abs(ocon->cy - snap_target->cy) < 10) {
             ocon->cy = snap_target->cy;
+        } else if (abs(ocon->cy + ocon->ch - snap_target->cy - snap_target->ch) < 10) {
+            ocon->cy = snap_target->cy + snap_target->ch - ocon->ch;
         }
     } else if (axis == 1) {
         if (ocon->cy >= snap_target->cy) {
@@ -619,10 +637,13 @@ static void snap_output(OutputConnection *ocon) {
         } else {
             ocon->cy = snap_target->cy - ocon->ch;
         }
-        if (abs(ocon->cx - snap_target->cx) < 10 || abs(ocon->cx + ocon->cw - snap_target->cx - snap_target->cw) < 10) {
+        if (abs(ocon->cx - snap_target->cx) < 10) {
             ocon->cx = snap_target->cx;
+        } else if (abs(ocon->cx + ocon->cw - snap_target->cx - snap_target->cw) < 10) {
+            ocon->cx = snap_target->cx + snap_target->cw - ocon->cw;
         }
     }
+    recenter_canvas();
 }
 
 static void update_total_screen_size() {
@@ -668,8 +689,6 @@ static void update_window_size() {
         if (!win_ocon) {
             win_ocon = head;
         }
-        printf("%d", win_ocon->crtc_info ? 1:0);
-        fflush(stdout);
         new_x = win_ocon->crtc_info->x + win_ocon->crtc_info->width / 2 - mw / 2;
         new_y = win_ocon->crtc_info->y + win_ocon->crtc_info->height / 2 - mh / 2;
 
@@ -688,9 +707,10 @@ static void update_window_size() {
         }
     }
 
-    button_apply.h = bh;
-    button_apply.y = mh - bh;
-    button_apply.x = mw - TEXTW(button_apply.text);
+    button_apply.h = bh*1.5;
+    button_apply.y = mh - 1.5*bh;
+    button_apply.x = cw;
+    button_apply.w = side_area;
 
 }
 
@@ -713,7 +733,7 @@ static void draw_output(OutputConnection *ocon) {
     snprintf(buf, sizeof buf, "%dx%d", ocon->w, ocon->h);
     drw_text(drw, ocon->cx+1, y, ocon->cw-2-bw, bh, lrpad/2, buf, 0);
 
-    if (ocon->crtc_info) {
+    if (!ocon->disabled) {
         drw_rect(drw, ocon->cx + boxs, ocon->cy + boxs, boxw, boxw, ocon->output == win_output, 0);
     }
 
@@ -725,30 +745,44 @@ static void draw_output(OutputConnection *ocon) {
     }
 }
 
-static void draw_modes() {
-    int i, start;
-    XRRModeInfo *mode_info;
+static int get_modes_start_y() {
+    return (int)(2.5*bh);
+}
 
-    start = selected_mode - (mh-2*bh)/bh;
-    start = MAX(start, 0);
-    for (i = start; i < selected_ocon->info->nmode; i++) {
+static int get_modes_per_page() {
+    return (mh-2*bh-get_modes_start_y())/bh;
+}
+
+static void draw_modes() {
+    int i, start_y, per_page;
+    XRRModeInfo *mode_info;
+    start_y = get_modes_start_y();
+    per_page = get_modes_per_page();
+
+    for (i = start_mode; i < selected_ocon->info->nmode && i < per_page + start_mode; i++) {
         mode_info = get_mode_info(selected_ocon->info->modes[i]);
 
         drw_setscheme(drw, i == selected_mode ? scheme[SchemeSel] : scheme[SchemeNorm]);
 
-        snprintf(buf, sizeof(buf), "%s %s %6.2fHz %s", mode_info->id == selected_ocon->mode ? "*" : " ",
+        snprintf(buf, sizeof(buf), "%s %s %6.2fHz %s",
+                 mode_info->id == selected_ocon->mode && !selected_ocon->disabled ? "*" : " ",
                  mode_info->name, mode_refresh(mode_info), i < selected_ocon->info->npreferred ? "(rec.)" : "");
-        drw_text(drw, cw, 0 + bh*(i-start), side_area, bh, lrpad/2, buf, 0);
+        drw_text(drw, cw, start_y + bh*(i-start_mode), side_area, bh, lrpad/2, buf, 0);
+    }
+    if (start_mode >= 0) {
+        drw_setscheme(drw, selected_mode == -1 ? scheme[SchemeSel] : scheme[SchemeNorm]);
+
+        snprintf(buf, sizeof(buf), "%s Disabled", selected_ocon->disabled ? "*" : " ");
+        drw_text(drw, cw, start_y -bh, side_area, bh, lrpad/2, buf, 0);
     }
 }
 
 static void draw(void) {
-    int i;
+    int i, w, x;
 
     drw_setscheme(drw, scheme[SchemeNorm]);
     drw_rect(drw, 0, 0, mw, mh, 1, 1);
 
-    drw_rect(drw, 0, 0, cw, ch, 0, 0);
 
     for (OutputConnection* ocon = head; ocon; ocon = ocon->next) {
         if (ocon != grabbed_ocon) {
@@ -760,29 +794,68 @@ static void draw(void) {
     }
 
     drw_setscheme(drw, scheme[SchemeNorm]);
+    drw_rect(drw, 0, 0, cw, ch, 0, 0);
     drw_rect(drw, cw, 0, cw-mw, mh, 1, 1);
+
+    drw_text(drw, cw, 0, side_area, bh, lrpad/2, "Modes:", 0);
 
     if (selected_ocon) {
        draw_modes();
+    } else {
+        drw_text(drw, cw, (int) bh*1.5, side_area, bh, lrpad/2, "  select output", 0);
+
     }
 
     for (i = 0; i < LENGTH(buttons); i++) {
         drw_setscheme(drw, buttons[i] == hovered_button ? scheme[SchemeMon] : scheme[SchemeNorm]);
-        drw_text(drw, buttons[i]->x, buttons[i]->y, buttons[i]->w, buttons[i]->h, lrpad/2, buttons[i]->text, 0);
+        drw_rect(drw, buttons[i]->x, buttons[i]->y, buttons[i]->w, buttons[i]->h, 1, 1);
+        w = TEXTW(buttons[i]->text);
+        x = buttons[i]->x;
+        if (w < buttons[i]->w) {
+            x += (buttons[i]->w - w)/2;
+        }
+        drw_text(drw, x, buttons[i]->y, w, buttons[i]->h, 0, buttons[i]->text, 0);
     }
     drw_map(drw, win, 0, 0, mw, mh);
 }
 
+static int scroll_to_selected_mode() {
+    int modes_per_page = get_modes_per_page();
+    if (start_mode > 0) {
+        if (selected_mode > start_mode + modes_per_page) {
+            start_mode = selected_mode - modes_per_page;
+            start_mode = MAX(start_mode, 0);
+        } else if (selected_mode <= start_mode) {
+            start_mode = selected_mode;
+        } else if (selected_ocon && start_mode + modes_per_page >= selected_ocon->info->nmode) {
+            start_mode = selected_ocon->info->nmode - modes_per_page;
+        } else {
+            return 0;
+        }
+        return 1;
+
+    }
+    return 0;
+}
+
 static void select_mode(OutputConnection *ocon, RRMode mode) {
-    XRRModeInfo *mode_info = get_mode_info(mode);
-    ocon->mode = mode;
-    ocon->w = mode_info->width;
-    ocon->h = mode_info->height;
-    update_canvas();
+    XRRModeInfo *mode_info;
+
+    if (selected_ocon) {
+        if (mode > 0) {
+            mode_info = get_mode_info(mode);
+            ocon->mode = mode;
+            ocon->w = (int) mode_info->width;
+            ocon->h = (int) mode_info->height;
+            ocon->disabled = False;
+            update_canvas();
+            snap_output(selected_ocon);
+        }
+    }
 }
 
 static void buttonpress(XButtonPressedEvent *e) {
-    int x, y, i;
+    int x, y, i, start_y;
     x = e->x;
     y = e->y;
 
@@ -791,29 +864,50 @@ static void buttonpress(XButtonPressedEvent *e) {
             if (x >= ocon->cx && x <= ocon->cx + ocon->cw
                 && y >= ocon->cy && y <= ocon->cy + ocon->ch) {
                 grabbed_ocon = ocon;
+                selected_ocon = ocon;
                 grabbed_offset_x = ocon->cx - x;
                 grabbed_offset_y = ocon->cy - y;
+                return;
             }
         }
-        if (!grabbed_ocon) {
-            for (i = 0; i < LENGTH(buttons); i++) {
-                if (x >= buttons[i]->x && x <= buttons[i]->x + buttons[i]->w
-                    && y >= buttons[i]->y && y <= buttons[i]->y + buttons[i]->h) {
-                    buttons[i]->callback();
-                }
+
+        for (i = LENGTH(buttons) - 1; i >= 0; i--) {
+            if (x >= buttons[i]->x && x <= buttons[i]->x + buttons[i]->w
+                && y >= buttons[i]->y && y <= buttons[i]->y + buttons[i]->h) {
+                buttons[i]->callback();
+                return;
             }
+        }
+
+        if (x >= cw) {
+            start_y = get_modes_start_y();
+            if (y < start_y && y >= start_y - bh) {
+                selected_mode = -1;
+                selected_ocon->disabled = True;
+            } else if (y < start_y + get_modes_per_page()*bh) {
+                selected_mode = (y-start_y + bh) / bh + start_mode - 1;
+                select_mode(selected_ocon, selected_ocon->info->modes[selected_mode]);
+            }
+        }
+    } else if (e->button == 4) {
+        if (start_mode > 0) {
+            start_mode--;
+        }
+    } else if (e->button == 5) {
+        if (selected_ocon && start_mode < selected_ocon->info->nmode-1-get_modes_per_page()) {
+            start_mode++;
         }
     }
 }
 
 static void buttonrelease(XButtonReleasedEvent *e) {
+
     if (e->button == 1) {
         if (grabbed_ocon) {
             selected_ocon = grabbed_ocon;
             selected_mode = 0;
             snap_output(grabbed_ocon);
             grabbed_ocon = NULL;
-            recenter_canvas();
         }
     }
 }
@@ -841,6 +935,7 @@ static void motion(XPointerMovedEvent *e) {
 static void keypress(XKeyEvent *ev) {
     KeySym ksym;
     Status status;
+    int last_mode;
 
     XmbLookupString(xic, ev, buf, sizeof buf, &ksym, &status);
     switch (status) {
@@ -854,20 +949,34 @@ static void keypress(XKeyEvent *ev) {
         default:
             return;
         case XK_Up:
-            if (selected_ocon && selected_mode > 0) {
-                selected_mode--;
+            if (selected_ocon) {
+                if (selected_mode >= 0) {
+                    selected_mode--;
+                }
+                if (!scroll_to_selected_mode() && start_mode > 0) {
+                    start_mode--;
+                }
             }
             break;
         case XK_Down:
-            if (selected_ocon && selected_mode < selected_ocon->info->nmode-1) {
-                selected_mode++;
+            if (selected_ocon) {
+                if (selected_mode < selected_ocon->info->nmode-1) {
+                    selected_mode++;
+                }
+
+                if (!scroll_to_selected_mode()  && selected_mode > get_modes_per_page() - start_mode) {
+                    start_mode++;
+                }
             }
             break;
         case XK_Return:
         case XK_KP_Enter:
-            if (selected_ocon && selected_mode >= 0 && selected_mode < selected_ocon->info->nmode) {
+            if (selected_mode == -1) {
+                selected_ocon->disabled = True;
+            } else {
                 select_mode(selected_ocon, selected_ocon->info->modes[selected_mode]);
             }
+
             break;
         case XK_Escape:
         case XK_q:

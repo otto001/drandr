@@ -1,0 +1,66 @@
+.TH drandr 1 drandr\-VERSION
+.SH NAME
+drandr \- dwm style logind tool
+.SH SYNOPSIS
+.B drandr
+.RB [ \-v ]
+.RB [ \-m
+.IR monitor ]
+.RB [ \-fn
+.IR font ]
+.RB [ \-nb
+.IR color ]
+.RB [ \-nf
+.IR color ]
+.RB [ \-sb
+.IR color ]
+.RB [ \-sf
+.IR color ]
+.RB [ \-w
+.IR windowid ]
+.P
+.SH DESCRIPTION
+.B drandr
+is a logind tool in the style of dwm. It allows the user to suspend/suspend-then-hibernate/hibernate/poweroff/reboot.
+.P
+.SH OPTIONS
+.TP
+.BI \-m " monitor"
+drandr is displayed on the monitor number supplied. Monitor numbers are starting
+from 0.
+.TP
+.BI \-fn " font"
+defines the font or font set used.
+.TP
+.BI \-nb " color"
+defines the normal background color.
+.IR #RGB ,
+.IR #RRGGBB ,
+and X color names are supported.
+.TP
+.BI \-nf " color"
+defines the normal foreground color.
+.TP
+.BI \-sb " color"
+defines the selected background color.
+.TP
+.BI \-sf " color"
+defines the selected foreground color.
+.TP
+.B \-v
+prints version information to stdout, then exits.
+.TP
+.BI \-w " windowid"
+embed into windowid.
+.SH USAGE
+drandr is completely controlled by the keyboard. Selection is made via the arrow keys up/down followed by enter.
+The input is then confirmed by pressing the first letter of the desired operation and pressing enter again,
+upon which the command is executed.
+
+.TP
+.B Return
+Confirm selection.
+
+.SH SEE ALSO
+.IR dwm (1)
+.IR systemctl (1)

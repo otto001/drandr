@@ -1,0 +1,24 @@
+drandr - dynamic sound
+====================
+drandr is sound manage util for dwm.
+
+
+Requirements
+------------
+In order to build drandr you need the Xlib header files.
+
+
+Installation
+------------
+Edit config.mk to match your local setup (drandr is installed into
+the /usr/local namespace by default).
+
+Afterwards enter the following command to build and install drandr
+(if necessary as root):
+
+    make clean install
+
+
+Running drandr
+-------------
+See the man page for details.

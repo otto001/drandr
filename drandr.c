@@ -73,8 +73,7 @@ Button* hovered_button;
 #define SCREENID_SIZE 3
 
 typedef struct OutputConnection OutputConnection;
-struct OutputConnection
-{
+struct OutputConnection {
     RROutput output;
     const char *edid;
     XRROutputInfo *info;
@@ -84,7 +83,16 @@ struct OutputConnection
 
     int cx, cy, cw, ch; // positions and sizes in canvas (gui), scaled down and translated from real values
     int x, y, w, h; // new, "real" positions and sizes
+
 };
+
+typedef struct CrtcWindow CrtcWindow;
+struct CrtcWindow {
+    Window win;
+    RRCrtc ctrc;
+};
+CrtcWindow* crtc_wins;
+int n_crtc_wins;
 
 static OutputConnection *head;
 
@@ -98,6 +106,7 @@ static void update_window_size();
 static void recenter_canvas();
 static void update_canvas();
 static void apply();
+static void create_crtc_windows(XRRScreenResources *sres);
 
 Button button_apply = {0, 0, 100, 12, "Apply", apply};
 Button* buttons[] = {&button_apply};
@@ -313,6 +322,8 @@ void get_outputs() {
             XRRFreeOutputInfo(info);
         }
     }
+    create_crtc_windows(sres);
+
     XRRFreeScreenResources(sres);
 }
 
@@ -707,7 +718,7 @@ static void update_window_size() {
 }
 
 static void draw_output(OutputConnection *ocon) {
-    int bw=4, y=ocon->cy;
+    int bw=2, y=ocon->cy;
     int boxs = drw->fonts->h / 9;
     int boxw = drw->fonts->h / 6 + 2;
 
@@ -719,6 +730,7 @@ static void draw_output(OutputConnection *ocon) {
     y += 1;
     drw_text(drw, ocon->cx+1, y, ocon->cw-2-bw, bh, lrpad/2, ocon->info->name, 0);
 
+    drw_setscheme(drw, scheme[SchemeNorm]);
     y += bh;
     snprintf(buf, sizeof buf, "%dx%d", ocon->w, ocon->h);
     drw_text(drw, ocon->cx+1, y, ocon->cw-2-bw, bh, lrpad/2, buf, 0);
@@ -728,8 +740,11 @@ static void draw_output(OutputConnection *ocon) {
     }
 
     y += bh;
-    drw_setscheme(drw, scheme[SchemeNorm]);
     drw_rect(drw, ocon->cx+1+bw, y, ocon->cw-2-2*bw, ocon->ch-1-1*bw - (y - ocon->cy), 1, 1);
+    if (bw > 0) {
+        drw_setscheme(drw, ocon == grabbed ? scheme[SchemeSel] : scheme[SchemeMon]);
+        drw_rect(drw, ocon->cx+1, ocon->cy+1+bh, bw, ocon->ch-1-bh-1*bw, 1, 1);
+    }
 }
 
 static void draw(void) {
@@ -915,6 +930,81 @@ static void grab_keyboard(void) {
     die("cannot grab keyboard");
 }
 
+static void create_crtc_windows(XRRScreenResources *sres) {
+    XClassHint ch = {"drandr", "drandr"};
+    XWindowAttributes wa;
+    XSetWindowAttributes swa;
+   // Drw *crtc_drw;
+    XRRCrtcInfo *crtc_info;
+    XRROutputInfo *output_info;
+    CrtcWindow *crtc_win;
+    int i, j, o, x, y, w, h;
+
+    swa.override_redirect = True;
+    swa.background_pixel = scheme[SchemeNorm][ColBg].pixel;
+    swa.event_mask = ExposureMask;
+
+
+    w = 300;
+
+    for (i = 0; i < sres->ncrtc; i++) {
+        crtc_info = XRRGetCrtcInfo(dpy, sres, sres->crtcs[i]);
+        crtc_win = NULL;
+
+        if (crtc_info->mode == None) {
+            XRRFreeCrtcInfo(crtc_info);
+            continue;
+        };
+
+        for (j = 0; j < n_crtc_wins; j++) {
+            if (crtc_wins[j].ctrc == sres->crtcs[i]) {
+                crtc_win = &crtc_wins[j];
+                break;
+            }
+        }
+        if (crtc_win) {
+            XDestroyWindow(dpy, crtc_win->win);
+            crtc_win->win = None;
+        } else {
+            n_crtc_wins++;
+            crtc_wins = realloc(crtc_wins, n_crtc_wins * sizeof(CrtcWindow));
+            crtc_win = &crtc_wins[n_crtc_wins-1];
+            crtc_win->ctrc = sres->crtcs[i];
+        }
+
+        x = crtc_info->x + 20 + (w+20)*i;
+        y = crtc_info->y + 100;
+        h = bh * (crtc_info->noutput + 3);
+
+        crtc_win->win = XCreateWindow(dpy, parentWin, x, y, w, h, 0,
+                            CopyFromParent, CopyFromParent, CopyFromParent,
+                            CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
+        XSetClassHint(dpy, win, &ch);
+        if (!XGetWindowAttributes(dpy, parentWin, &wa))
+            die("could not get embedding window attributes: 0x%lx",
+                parentWin);
+
+        drw_setscheme(drw, scheme[SchemeSel]);
+
+        for (o = 0; o < crtc_info->noutput; o++) {
+            output_info = XRRGetOutputInfo(dpy, sres, crtc_info->outputs[o]);
+            drw_text(drw, 0, bh*o, w, bh, lrpad/2, output_info->name, 0);
+            XRRFreeOutputInfo(output_info);
+        }
+        drw_setscheme(drw, scheme[SchemeNorm]);
+
+        snprintf(buf, sizeof buf, "%dx%d", crtc_info->width, crtc_info->height);
+        drw_text(drw, 0, bh*crtc_info->noutput, w, bh, lrpad/2, buf, 0);
+
+        XMapRaised(dpy, crtc_win->win);
+        drw_map(drw, crtc_win->win, 0, 0, w, h);
+        XMapRaised(dpy, crtc_win->win);
+        XSync(dpy, False);
+
+        XRRFreeCrtcInfo(crtc_info);
+    }
+}
+
 static void setup(void) {
     int x, y, i, j;
     unsigned int du;
@@ -922,7 +1012,7 @@ static void setup(void) {
     XIM xim;
     Window w, dw, *dws;
     XWindowAttributes wa;
-    XClassHint ch = {"daudio", "daudio"};
+    XClassHint ch = {"drandr", "drandr"};
 #ifdef XINERAMA
     XineramaScreenInfo *info;
     Window pw;
@@ -999,9 +1089,6 @@ static void setup(void) {
                     XNClientWindow, win, XNFocusWindow, win, NULL);
 
     XMapRaised(dpy, win);
-
-    drw_resize(drw, mw, mh);
-    draw();
 
     grab_focus();
     grab_keyboard();

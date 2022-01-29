@@ -1,20 +1,16 @@
 /* See LICENSE file for copyright and license details. */
-#include <ctype.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
-#include <unistd.h>
-#include <stdint.h>
 
 #include <sys/wait.h>
 #include <sys/file.h>
 #include <errno.h>
 
 #include <X11/Xlib.h>
-#include <X11/Xatom.h>
 #include <X11/Xutil.h>
 
 #ifdef XINERAMA
@@ -69,9 +65,11 @@ struct Button {
 };
 Button* hovered_button;
 
-#define EVENT_SIZE 128
 #define EDID_SIZE 513
-#define SCREENID_SIZE 3
+
+enum {
+    Top, Right, Bottom, Left
+};
 
 typedef struct OutputConnection OutputConnection;
 struct OutputConnection {
@@ -176,7 +174,7 @@ void append_output_connection(OutputConnection *ocon) {
 }
 
 
-const char *get_edid(Display* dpy, RROutput out) {
+const char *get_edid(RROutput out) {
     int props = 0;
     Atom *properties;
     Atom atom_edid, real;
@@ -225,7 +223,7 @@ OutputConnection *create_output_connection(RROutput output, XRROutputInfo *info)
         info = XRRGetOutputInfo(dpy, sres, output);
     }
 
-    edid = get_edid(dpy, output);
+    edid = get_edid(output);
 
     for (ocon = head; ocon;) {
         if (edid && ocon->edid && strcmp(edid, ocon->edid) == 0) {
@@ -249,8 +247,8 @@ OutputConnection *create_output_connection(RROutput output, XRROutputInfo *info)
         ocon->crtc_info = XRRGetCrtcInfo(dpy, sres, info->crtc);
         ocon->x = ocon->crtc_info->x;
         ocon->y = ocon->crtc_info->y;
-        ocon->w = ocon->crtc_info->width;
-        ocon->h = ocon->crtc_info->height;
+        ocon->w = (int) ocon->crtc_info->width;
+        ocon->h = (int) ocon->crtc_info->height;
         ocon->mode = ocon->crtc_info->mode;
 
     } else {
@@ -337,10 +335,37 @@ static void handle_randr_event(XRRNotifyEvent* ev) {
     }
 }
 
+static OutputConnection *get_next_neighbor(OutputConnection *ocon, OutputConnection *start, OutputConnection *end,
+                                           int *direction) {
+    OutputConnection *iter;
+    for (iter = start ? start->next : head; iter && iter != end; iter = iter->next) {
+        if (iter == ocon) continue;
+        if (ocon->cy <= iter->cy + iter->ch && ocon->cy >= iter->cy) {
+            if (ocon->cx + ocon->cw == iter->cx) {
+                *direction = Left;
+                return iter;
+            } else if (ocon->cx == iter->cx + iter->cw) {
+                *direction = Right;
+                return iter;
+            }
+        } else if (ocon->cx <= iter->cx + iter->cw && ocon->cx >= iter->cx) {
+            if (ocon->cy + ocon->ch == iter->cy) {
+                *direction = Top;
+                return iter;
+            } else if (ocon->cy == iter->cy + iter->ch) {
+                *direction = Bottom;
+                return iter;
+            }
+        }
+    }
+    return NULL;
+}
+
 static void setup_new_coordinates(int *screen_width, int *screen_height, int *screen_width_mm, int *screen_height_mm,
                                   double *dpi) {
-    OutputConnection *reference, *ocon;
+    OutputConnection *reference, *ocon, *neighbor;
     int nst = INT_MAX, nsr = INT_MIN, nsb = INT_MIN, nsl = INT_MAX; // new screen top, right, bottom, left
+    int neighbordir;
 
     for (reference = head; reference && !reference->crtc_info; reference = reference->next) {}
     if (!reference) {
@@ -351,8 +376,31 @@ static void setup_new_coordinates(int *screen_width, int *screen_height, int *sc
 
     for (ocon = head; ocon; ocon = ocon->next) {
         if (ocon->info->connection == RR_Disconnected || ocon->disabled) continue;
+        neighbor = NULL;
+
         ocon->x = (int) ((ocon->cx - reference->cx) / canvas_scale);
         ocon->y = (int) ((ocon->cy - reference->cy) / canvas_scale);
+
+        while ((neighbor = get_next_neighbor(ocon, neighbor, ocon, &neighbordir))) {
+            switch (neighbordir) {
+                case Top:
+                    ocon->y = neighbor->y - ocon->h;
+                    break;
+                case Bottom:
+                    ocon->y = neighbor->y + neighbor->h;
+                    break;
+                case Left:
+                    ocon->x = neighbor->x - ocon->w;
+                    break;
+                case Right:
+                    ocon->x = neighbor->x + neighbor->w;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+
         int ocun_right = (int) ocon->x + ocon->w;
         int ocun_bottom = (int) ocon->y + ocon->h;
         nsl = MIN(nsl, ocon->x);
@@ -380,11 +428,10 @@ static void setup_new_coordinates(int *screen_width, int *screen_height, int *sc
 static void disable_crtc(RRCrtc ctrc) {
     XRRSetCrtcConfig (dpy, sres, ctrc, CurrentTime,
                       0, 0, None, RR_Rotate_0, NULL, 0);
-    printf("disbaled crtc %d\n", ctrc);
+    printf("disbaled crtc %ld\n", ctrc);
 }
 
 static void disable_unused_crtcs(int screen_width, int screen_height) {
-    OutputConnection *ocon;
     XRRCrtcInfo *crtc_info;
     XRROutputInfo *output_info;
     int i, o;
@@ -613,7 +660,7 @@ static OutputConnection *get_snap_target(OutputConnection *ocon, int *axis, Bool
 
 static void snap_output(OutputConnection *ocon) {
     int axis = -1; // 0 = snap along x axis, 1 = snap along y axis
-    OutputConnection *snap_target, *iter;
+    OutputConnection *snap_target;
 
     snap_target = get_snap_target(ocon, &axis, True);
     if (!snap_target) {
@@ -681,16 +728,16 @@ static void update_window_size() {
         cw = mw - side_area;
         ch = mh;
 
-        canvas_scale_x = cw/((double) mcw * 2);
-        canvas_scale_y = ch/((double) mch * 2);
+        canvas_scale_x = cw/((double) mcw * 1.5);
+        canvas_scale_y = ch/((double) mch * 1.5);
         canvas_scale = MIN(canvas_scale_x, canvas_scale_y);
 
         for (win_ocon = head; win_ocon && win_ocon->output != win_output; win_ocon = win_ocon->next) {}
         if (!win_ocon) {
             win_ocon = head;
         }
-        new_x = win_ocon->crtc_info->x + win_ocon->crtc_info->width / 2 - mw / 2;
-        new_y = win_ocon->crtc_info->y + win_ocon->crtc_info->height / 2 - mh / 2;
+        new_x = (int) (win_ocon->crtc_info->x + win_ocon->crtc_info->width / 2) - mw / 2;
+        new_y = (int) (win_ocon->crtc_info->y + win_ocon->crtc_info->height / 2) - mh / 2;
 
         if (mw != wa.width || mh != wa.height || new_x != wa.x || new_y != wa.y) {
 
@@ -707,8 +754,8 @@ static void update_window_size() {
         }
     }
 
-    button_apply.h = bh*1.5;
-    button_apply.y = mh - 1.5*bh;
+    button_apply.h = (int) (bh*1.5);
+    button_apply.y = (int) (mh - 1.5*bh);
     button_apply.x = cw;
     button_apply.w = side_area;
 
@@ -716,8 +763,8 @@ static void update_window_size() {
 
 static void draw_output(OutputConnection *ocon) {
     int bw=2, y=ocon->cy;
-    int boxs = drw->fonts->h / 9;
-    int boxw = drw->fonts->h / 6 + 2;
+    int boxs = (int) drw->fonts->h / 9;
+    int boxw = (int) drw->fonts->h / 6 + 2;
     Bool is_selected = ocon == grabbed_ocon || ocon == selected_ocon;
 
     drw_setscheme(drw, is_selected ? scheme[SchemeSel] : scheme[SchemeMon]);
@@ -764,7 +811,7 @@ static void draw_modes() {
 
         drw_setscheme(drw, i == selected_mode ? scheme[SchemeSel] : scheme[SchemeNorm]);
 
-        snprintf(buf, sizeof(buf), "%s %s %6.2fHz %s",
+        snprintf(buf, sizeof(buf), "%s %-9s %6.2fHz %s",
                  mode_info->id == selected_ocon->mode && !selected_ocon->disabled ? "*" : " ",
                  mode_info->name, mode_refresh(mode_info), i < selected_ocon->info->npreferred ? "(rec.)" : "");
         drw_text(drw, cw, start_y + bh*(i-start_mode), side_area, bh, lrpad/2, buf, 0);
@@ -802,7 +849,7 @@ static void draw(void) {
     if (selected_ocon) {
        draw_modes();
     } else {
-        drw_text(drw, cw, (int) bh*1.5, side_area, bh, lrpad/2, "  select output", 0);
+        drw_text(drw, cw, (int) (bh*1.5), side_area, bh, lrpad/2, "  select output", 0);
 
     }
 
@@ -935,7 +982,6 @@ static void motion(XPointerMovedEvent *e) {
 static void keypress(XKeyEvent *ev) {
     KeySym ksym;
     Status status;
-    int last_mode;
 
     XmbLookupString(xic, ev, buf, sizeof buf, &ksym, &status);
     switch (status) {
@@ -1035,7 +1081,6 @@ static void run(void) {
             }
         }
     }
-    cleanup();
 }
 
 
@@ -1069,7 +1114,7 @@ static void grab_keyboard(void) {
 }
 
 static void create_crtc_windows() {
-    XClassHint ch = {"drandr", "drandr"};
+    XClassHint classhint = {"drandr", "drandr"};
     XWindowAttributes wa;
     XSetWindowAttributes swa;
    // Drw *crtc_drw;
@@ -1117,7 +1162,7 @@ static void create_crtc_windows() {
         crtc_win->win = XCreateWindow(dpy, parentWin, x, y, w, h, 0,
                             CopyFromParent, CopyFromParent, CopyFromParent,
                             CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
-        XSetClassHint(dpy, win, &ch);
+        XSetClassHint(dpy, win, &classhint);
         if (!XGetWindowAttributes(dpy, parentWin, &wa))
             die("could not get embedding window attributes: 0x%lx",
                 parentWin);
@@ -1150,7 +1195,7 @@ static void setup(void) {
     XIM xim;
     Window w, dw, *dws;
     XWindowAttributes wa;
-    XClassHint ch = {"drandr", "drandr"};
+    XClassHint classhint = {"drandr", "drandr"};
 #ifdef XINERAMA
     XineramaScreenInfo *info;
     Window pw;
@@ -1209,14 +1254,14 @@ static void setup(void) {
     }
 
     /* create menu window */
-    swa.override_redirect = True;
+    swa.override_redirect = False;
     swa.background_pixel = scheme[SchemeNorm][ColBg].pixel;
     swa.event_mask = ExposureMask | KeyPressMask | VisibilityChangeMask
             | ButtonPressMask | ButtonReleaseMask | PointerMotionMask;
     win = XCreateWindow(dpy, parentWin, x, y, mw, mh, 0,
                         CopyFromParent, CopyFromParent, CopyFromParent,
                         CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
-    XSetClassHint(dpy, win, &ch);
+    XSetClassHint(dpy, win, &classhint);
 
 
     /* input methods */
